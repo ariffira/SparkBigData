@@ -9,6 +9,7 @@ import org.apache.spark.mllib.recommendation.ALS;
 import org.apache.spark.mllib.recommendation.MatrixFactorizationModel;
 import org.apache.spark.mllib.recommendation.Rating;
 import org.apache.spark.storage.StorageLevel;
+import java.io.File;
 
 import java.util.Map;
 
@@ -17,22 +18,24 @@ import org.apache.spark.SparkConf;
 
 public class RecommendationModel {
 	
+	private static JavaSparkContext sc;
+	
 	public static void main(String[] args){
 		
 		/**
 		 * Setting Winutil property is only valid for Windows machine
 		 */
-		Helper.setProperty();
+		String exePath = "src/main/resources/WinUtils/";
+		File exeFile = new File(exePath);
+		System.setProperty("hadoop.home.dir", exeFile.getAbsolutePath());
 		
 		//Initializing Spark
-		SparkConf conf = new SparkConf().setAppName("Rating").setMaster("local[4]");
-		@SuppressWarnings("resource")
-		JavaSparkContext sc = new JavaSparkContext(conf);
+		SparkConf conf = new SparkConf().setAppName("big-data").setMaster("local[2]");
+		sc = new JavaSparkContext(conf);
 	
 		//Reading Data, here we we put rating and product/movie data for later train
-		final JavaRDD<String> ratingData = sc.textFile("src/main/resources/mllib/ratings.dat");
+		JavaRDD<String> ratingData = sc.textFile("src/main/resources/mllib/ratings.dat");
 		JavaRDD<String> productData = sc.textFile("src/main/resources/mllib/movies.dat");
-	
 		JavaRDD<Tuple2<Integer, Rating>> ratings = ratingData.map(
 		        new Function<String, Tuple2<Integer, Rating>>() {
 		            /**
@@ -192,6 +195,7 @@ public class RecommendationModel {
          * Lambda(regularization constant)&	
          * number of iterations					
          */
+		
 		int[] ranks = {8, 12};
 		float[] lambdas = {0.1f, 10.0f};
 		int[] numIters = {10, 20};
@@ -200,16 +204,19 @@ public class RecommendationModel {
 		int bestRank = 0;
 		float bestLambda = -1.0f;
 		int bestNumIter = -1;
+		//int rank = 10;
+	    //int numIterations = 2;
+	    //MatrixFactorizationModel bestModel = ALS.train(JavaRDD.toRDD(training), rank, numIterations, 0.01);
 		
-		MatrixFactorizationModel bestModel = null;
+	    MatrixFactorizationModel bestModel = null;
 		for (int currentRank : ranks) {
 		    for (float currentLambda : lambdas) {
 		        for (int currentNumIter : numIters) {
 		            MatrixFactorizationModel model = ALS.train(JavaRDD.toRDD(training), currentRank, currentNumIter, currentLambda);
 
-		            Double validationRmse = ComputeRMSE.computeRMSE(model, validation);
-		            System.out.println("RMSE (validation) = " + validationRmse + " for the model trained with rank = "
-		                    + currentRank + ", lambda = " + currentLambda + ", and numIter = " + currentNumIter + ".");
+		            Double validationRmse = computeRMSE(model, validation);
+		            System.out.println("RMSE (Validation) = " + validationRmse + "for the model Trained with rank = "
+		                    + currentRank + ",Lambda = " + currentLambda + ",and Number of Iterations = " + currentNumIter + ".");
 
 		            if (validationRmse < bestValidationRmse) {
 		                bestModel = model;
@@ -221,15 +228,88 @@ public class RecommendationModel {
 		        }
 		    }
 		}
+		
 		//Computing Root Mean Square Error in the test data set
-		Double testRmse = ComputeRMSE.computeRMSE(bestModel, test);
+		Double testRmse = computeRMSE(bestModel, test);
 		System.out.println("The computation Result:");
 		System.out.println("The best model was trained with rank = " + bestRank);
 		System.out.println(" and lambda = " + bestLambda);
 		System.out.println(", and numIter = " + bestNumIter);
 		System.out.println("So, the RMSE(Root Mean Square Error) on the test set is " + testRmse + ".");
-		
+
 		sc.stop();
-		
+
+		//get 50s best recommendation from GetRecommendation
+		//GetRecommendations.getRecommendations(bestNumIter, bestModel, ratings, products);
+			
 	}
+	
+	/**
+	* Calculating the Root Mean Squared Error (computeRMSE)
+	*
+	* @param model best model generated.
+	* @param data  rating data.
+	* @return      Root Mean Squared Error
+	*/
+	public final static Double computeRMSE(MatrixFactorizationModel model, JavaRDD<Rating> data) {
+	JavaRDD<Tuple2<Object, Object>> userProducts = data.map(
+	        new Function<Rating, Tuple2<Object, Object>>() {
+	            /**
+				 * 
+				 */
+				private static final long serialVersionUID = 1L;
+
+				public Tuple2<Object, Object> call(Rating r) {
+	                return new Tuple2<Object, Object>(r.user(), r.product());
+	            }
+	        }
+	);
+
+	JavaPairRDD<Tuple2<Integer, Integer>, Double> predictions = JavaPairRDD.fromJavaRDD(
+	        model.predict(JavaRDD.toRDD(userProducts)).toJavaRDD().map(
+	                new Function<Rating, Tuple2<Tuple2<Integer, Integer>, Double>>() {
+	                    /**
+						 * 
+						 */
+						private static final long serialVersionUID = 1L;
+
+						public Tuple2<Tuple2<Integer, Integer>, Double> call(Rating r) {
+	                        return new Tuple2<Tuple2<Integer, Integer>, Double>(
+	                                new Tuple2<Integer, Integer>(r.user(), r.product()), r.rating());
+	                    }
+	                }
+	        ));
+	JavaRDD<Tuple2<Double, Double>> predictionsAndRatings =
+	        JavaPairRDD.fromJavaRDD(data.map(
+	                new Function<Rating, Tuple2<Tuple2<Integer, Integer>, Double>>() {
+	                    /**
+						 * 
+						 */
+						private static final long serialVersionUID = 1L;
+
+						public Tuple2<Tuple2<Integer, Integer>, Double> call(Rating r) {
+	                        return new Tuple2<Tuple2<Integer, Integer>, Double>(
+	                                new Tuple2<Integer, Integer>(r.user(), r.product()), r.rating());
+	                    }
+	                }
+	        )).join(predictions).values();
+
+	double mse =  JavaDoubleRDD.fromRDD(predictionsAndRatings.map(
+	        new Function<Tuple2<Double, Double>, Object>() {
+	            /**
+				 * 
+				 */
+				private static final long serialVersionUID = 1L;
+
+				public Object call(Tuple2<Double, Double> pair) {
+	                Double err = pair._1() - pair._2();
+	                return err * err;
+	            }
+	        }
+	).rdd()).mean();
+
+	return Math.sqrt(mse);
+	
+	}
+
 }
